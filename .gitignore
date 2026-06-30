@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Output / generated files
+*.fit
+_begleitliste.csv
+begleitliste.csv
+fit_out/
+output/
+
+# Keep example data
+!examples/*.fit
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Pytest
+.pytest_cache/
+.coverage

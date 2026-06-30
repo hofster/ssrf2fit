@@ -1,0 +1,2 @@
+fit_tool>=0.9.15
+timezonefinder>=8.0.0

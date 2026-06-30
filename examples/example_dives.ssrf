@@ -1,0 +1,69 @@
+<divelog program='subsurface' version='3'>
+<settings>
+</settings>
+<divesites>
+<site uuid='11111111' name='Example Lake' gps='52.500000 13.200000'>
+  <geo cat='2' origin='2' value='Germany'/>
+</site>
+<site uuid='22222222' name='Example Reef' gps='39.360000 3.220000'>
+  <geo cat='2' origin='2' value='Spain'/>
+</site>
+<site uuid='33333333' name='Example Wall' gps='27.160000 33.980000'>
+  <geo cat='2' origin='2' value='Egypt'/>
+</site>
+</divesites>
+<dives>
+<dive number='1' sac='18.5 l/min' divesiteid='11111111' watersalinity='1000 g/l' date='2018-06-15' time='10:30:00' duration='42:10 min'>
+  <divemaster>Example Guide</divemaster>
+  <buddy>Example Buddy</buddy>
+  <notes>Training dive, good visibility</notes>
+  <suit>7mm wetsuit</suit>
+  <cylinder size='12.0 l' start='200.0 bar' end='70.0 bar' />
+  <weightsystem weight='8.0 kg' description='integrated' />
+  <divetemperature air='22.0 C'/>
+  <divecomputer model='Example DiveComputer'>
+  <depth max='18.30 m' mean='9.100 m' />
+  <temperature water='14.0 C' />
+  <sample time='0:00 min' depth='0.0 m' temp='14.0 C' />
+  <sample time='1:00 min' depth='8.5 m' />
+  <sample time='2:00 min' depth='18.3 m' />
+  <sample time='20:00 min' depth='17.8 m' />
+  <sample time='38:00 min' depth='5.0 m' />
+  <sample time='42:10 min' depth='0.0 m' />
+  </divecomputer>
+</dive>
+<dive number='2' sac='16.0 l/min' divesiteid='22222222' watersalinity='1030 g/l' date='2019-08-20' time='11:15:00' duration='48:30 min'>
+  <divemaster>Example Center</divemaster>
+  <buddy>Example Buddy</buddy>
+  <notes>Drift dive along the wall</notes>
+  <suit>5mm wetsuit</suit>
+  <cylinder size='12.0 l' start='210.0 bar' end='60.0 bar' />
+  <weightsystem weight='6.0 kg' description='weight-belt' />
+  <divetemperature air='28.0 C'/>
+  <divecomputer model='Example DiveComputer'>
+  <depth max='27.50 m' mean='14.200 m' />
+  <temperature water='24.0 C' />
+  <sample time='0:00 min' depth='0.0 m' temp='24.0 C' />
+  <sample time='1:30 min' depth='12.0 m' />
+  <sample time='3:00 min' depth='27.5 m' />
+  <sample time='25:00 min' depth='18.0 m' />
+  <sample time='45:00 min' depth='5.0 m' />
+  <sample time='48:30 min' depth='0.0 m' />
+  </divecomputer>
+</dive>
+<dive number='3' divesiteid='33333333' watersalinity='1030 g/l' date='2020-10-05' time='09:00:00' duration='35:00 min'>
+  <notes>Manually logged (computer failure)</notes>
+  <suit>3mm shorty</suit>
+  <weightsystem weight='5.0 kg' description='integrated' />
+  <divetemperature air='30.0 C'/>
+  <divecomputer model='Manual'>
+  <depth max='22.00 m' mean='12.000 m' />
+  <temperature water='27.0 C' />
+  <sample time='0:00 min' depth='0.0 m' temp='27.0 C' />
+  <sample time='2:00 min' depth='22.0 m' />
+  <sample time='30:00 min' depth='22.0 m' />
+  <sample time='35:00 min' depth='0.0 m' />
+  </divecomputer>
+</dive>
+</dives>
+</divelog>

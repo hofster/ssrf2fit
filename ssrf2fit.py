@@ -45,20 +45,38 @@ from fit_tool.profile.messages.event_message import EventMessage
 from fit_tool.profile.profile_type import (
     Sport, SubSport, FileType, Manufacturer, Event, EventType, Activity, WaterType
 )
+try:  # Flaschendruck: nicht in jeder fit_tool-Version vorhanden
+    from fit_tool.profile.messages.tank_update_message import TankUpdateMessage
+    from fit_tool.profile.messages.tank_summary_message import TankSummaryMessage
+except Exception:
+    TankUpdateMessage = TankSummaryMessage = None
+try:  # Gasmischung (dive_gas)
+    from fit_tool.profile.messages.dive_gas_message import DiveGasMessage
+except Exception:
+    DiveGasMessage = None
 from fit_tool.data_message import Field
 from fit_tool.base_type import BaseType
 
 
 def add_dive_field(msg, name, fid, value, scale=1000, units="m"):
-    """Fuegt ein im fit_tool-Profil fehlendes Tauch-Feld manuell hinzu.
-    fit_tool kennt session.avg_depth/max_depth (140/141) und die
-    lap-Pendants (122/123) nicht, Garmin liest sie aber fuer die Anzeige."""
+    """Fuegt ein Tauch-Feld hinzu oder ersetzt ein bestehendes Feld mit gleicher ID."""
     if value is None:
         return
+    # Bestehendes Feld mit gleicher field_id entfernen, um Kollisionen zu vermeiden
+    msg.fields = [field for field in msg.fields if getattr(field, "field_id", None) != fid]
+    
+    raw = int(round(value * scale))
     f = Field(name=name, field_id=fid, base_type=BaseType.UINT32,
               scale=scale, offset=0, units=units, size=4)
-    f.set_values([value])
+    try:
+        f.set_value(0, value)
+    except Exception:
+        pass
+    enc = getattr(f, "encoded_values", None)
+    if not enc or enc[0] != raw:
+        f.encoded_values = [raw]
     msg.fields.append(f)
+
 
 try:
     from timezonefinder import TimezoneFinder
@@ -97,20 +115,36 @@ def num(s):
     m = re.search(r"-?\d+\.?\d*", s)
     return float(m.group()) if m else None
 
+def parse_clock(s):
+    """'27:40 min', '1:05:20 h' oder '27:40.5' -> Sekunden (float) oder None."""
+    if not s: return None
+    m = re.match(r"\s*(?:(\d+):)?(\d+):(\d+(?:\.\d+)?)", s)
+    if m:
+        h = int(m.group(1) or 0)
+        return h * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+    return None
+
 def parse_duration(s):
     """'27:40 min' -> Sekunden."""
     if not s: return None
-    m = re.match(r"(\d+):(\d+)", s)
-    if m: return int(m.group(1)) * 60 + int(m.group(2))
+    v = parse_clock(s)
+    if v is not None: return int(round(v))
     n = num(s)
     return int(n * 60) if n else None
 
 def parse_sample_time(s):
     """'1:20 min' -> Sekunden."""
-    if not s: return None
-    m = re.match(r"(\d+):(\d+)", s)
-    if m: return int(m.group(1)) * 60 + int(m.group(2))
-    return None
+    v = parse_clock(s)
+    return int(round(v)) if v is not None else None
+
+def mean_depth_from_samples(samples):
+    """Zeitgewichtete Durchschnittstiefe (Trapezregel) aus den Samples."""
+    if len(samples) < 2: return None
+    area = 0.0
+    for a, b in zip(samples, samples[1:]):
+        area += (a["depth"] + b["depth"]) / 2.0 * (b["t"] - a["t"])
+    span = samples[-1]["t"] - samples[0]["t"]
+    return area / span if span > 0 else None
 
 
 # ---------- SSRF Parsing ----------
@@ -155,6 +189,7 @@ def extract_dive(dive, sites):
     d["cyl_start"] = num(cyl.get("start")) if cyl is not None else None
     d["cyl_end"] = num(cyl.get("end")) if cyl is not None else None
     d["o2"] = num(cyl.get("o2")) if cyl is not None else None
+    d["he"] = num(cyl.get("he")) if cyl is not None else None
 
     ws = dive.find("weightsystem")
     d["weight"] = num(ws.get("weight")) if ws is not None else None
@@ -165,6 +200,19 @@ def extract_dive(dive, sites):
 
     dc = dive.find("divecomputer")
     d["dc_model"] = dc.get("model") if dc is not None else None
+    d["dc_serial"] = None
+    if dc is not None:
+        sn = None
+        for ex in dc.findall("extradata"):
+            if (ex.get("key") or "").lower() == "serial": sn = ex.get("value")
+        if sn and sn.strip().isdigit():
+            d["dc_serial"] = int(sn)
+        elif dc.get("deviceid"):
+            try: d["dc_serial"] = int(dc.get("deviceid"), 16)
+            except ValueError: pass
+        w = dc.find("water")
+        if d["salinity"] is None and w is not None:
+            d["salinity"] = num(w.get("salinity"))
     depth = dc.find("depth") if dc is not None else None
     d["maxdepth"] = num(depth.get("max")) if depth is not None else None
     d["avgdepth"] = num(depth.get("mean")) if depth is not None else None
@@ -173,22 +221,185 @@ def extract_dive(dive, sites):
 
     samples = []
     src = dc if dc is not None else dive
+    last_temp = None
     for sm in src.findall("sample"):
         t = parse_sample_time(sm.get("time"))
         dep = num(sm.get("depth"))
         tmp = num(sm.get("temp"))
+        pr = num(sm.get("pressure0"))
+        # Subsurface schreibt 'temp' nur bei Aenderung bzw. 0.0 als "kein Wert":
+        # Werte <= 0 ignorieren und letzten gueltigen Wert fortschreiben.
+        if tmp is not None and tmp > 0: last_temp = tmp
         if t is None or dep is None: continue
-        samples.append({"t": t, "depth": dep, "temp": tmp})
+        samples.append({"t": t, "depth": dep, "temp": last_temp,
+                        "pressure": pr if (pr is not None and pr > 0) else None})
+    samples.sort(key=lambda x: x["t"])
+    # Fuehrende Samples ohne Temperatur mit dem ersten bekannten Wert fuellen
+    first_known = next((x["temp"] for x in samples if x["temp"] is not None), None)
+    for x in samples:
+        if x["temp"] is None: x["temp"] = first_known
     d["samples"] = samples
+    prs = [x["pressure"] for x in samples if x["pressure"] is not None]
+    d["p_start"] = prs[0] if prs else None
+    d["p_end"] = prs[-1] if prs else None
+    temps = [x["temp"] for x in samples if x["temp"] is not None]
+    d["temp_avg"] = sum(temps) / len(temps) if temps else None
+    d["temp_max"] = max(temps) if temps else None
+    d["temp_min"] = min(temps) if temps else None
 
     if d["maxdepth"] is None and samples:
         d["maxdepth"] = max(s["depth"] for s in samples)
     if d["duration"] is None and samples:
         d["duration"] = samples[-1]["t"]
+    # Mittlere Tiefe: Subsurface liefert bei importierten Computern oft 0 m
+    if not d["avgdepth"] or d["avgdepth"] <= 0:
+        d["avgdepth"] = mean_depth_from_samples(samples)
+    if d["watertemp"] is not None and d["watertemp"] <= 0:
+        d["watertemp"] = None
     if d["watertemp"] is None:
-        for s in samples:
-            if s["temp"] is not None: d["watertemp"] = s["temp"]; break
+        d["watertemp"] = d["temp_avg"]
     return d
+
+
+# ---------- FIT-Nachbearbeitung ----------
+# fit_tool schreibt manuell angehaengte Felder (Tiefe in Session/Lap) als 0.
+# Statt sich auf die Interna von fit_tool zu verlassen, werden die Bytes nach
+# dem Schreiben direkt korrigiert und die Datei-CRC neu berechnet.
+
+_CRC_T = [0x0000, 0xCC01, 0xD801, 0x1400, 0xF001, 0x3C00, 0x2800, 0xE401,
+          0xA001, 0x6C00, 0x7800, 0xB401, 0x5000, 0x9C01, 0x8801, 0x4400]
+
+def fit_crc(data, crc=0):
+    for b in data:
+        crc = (crc >> 4 & 0x0FFF) ^ _CRC_T[crc & 0xF] ^ _CRC_T[b & 0xF]
+        crc = (crc >> 4 & 0x0FFF) ^ _CRC_T[crc & 0xF] ^ _CRC_T[b >> 4 & 0xF]
+    return crc
+
+def patch_fit_fields(path, patches):
+    """patches: {(global_msg_num, field_id): rohwert_uint32}.
+    Ueberschreibt 4-Byte-Felder in-place und aktualisiert die CRC.
+    Gibt die Anzahl der gepatchten Felder zurueck."""
+    import struct
+    data = bytearray(open(path, "rb").read())
+    hs = data[0]
+    pos, end = hs, len(data) - 2
+    defs, done = {}, 0
+    while pos < end:
+        h = data[pos]; pos += 1
+        if h & 0x80:                       # komprimierter Zeitstempel-Header
+            lt = (h >> 5) & 3; is_def = False
+        else:
+            lt = h & 0x0F; is_def = bool(h & 0x40)
+        if is_def:
+            pos += 1                       # reserved
+            en = ">" if data[pos] else "<"; pos += 1
+            gm = struct.unpack(en + "H", data[pos:pos+2])[0]; pos += 2
+            n = data[pos]; pos += 1
+            fl = [tuple(data[pos+3*i:pos+3*i+3]) for i in range(n)]; pos += 3 * n
+            dev = 0
+            if h & 0x20:
+                nd = data[pos]; pos += 1; dev = sum(data[pos+3*i+1] for i in range(nd)); pos += 3 * nd
+            defs[lt] = (en, gm, fl, dev)
+        else:
+            en, gm, fl, dev = defs[lt]
+            for fid, sz, _bt in fl:
+                if (gm, fid) in patches and sz == 4:
+                    data[pos:pos+4] = struct.pack(en + "I", patches[(gm, fid)]); done += 1
+                pos += sz
+            pos += dev
+    data[-2:] = struct.pack("<H", fit_crc(data[:-2]))
+    open(path, "wb").write(bytes(data))
+    return done
+
+
+def add_message_index(path, targets=(18, 19), index=0):
+    """Haengt Feld 254 (message_index) an Session (18) und Lap (19) an, falls
+    es fehlt. dive_summary verweist per reference_index darauf; ohne
+    message_index kann Garmin die Summary (Tauchzeit, Ein-/Auftauchzeit)
+    nicht zuordnen. Schreibt Definitionen und Daten neu, korrigiert Header
+    und CRCs. Gibt die Anzahl erweiterter Definitionen zurueck."""
+    import struct
+    data = bytes(open(path, "rb").read())
+    hs = data[0]
+    pos, end = hs, len(data) - 2
+    out, defs, n_ext = bytearray(), {}, 0
+    while pos < end:
+        h = data[pos]; start = pos; pos += 1
+        if h & 0x80:
+            lt = (h >> 5) & 3; is_def = False
+        else:
+            lt = h & 0x0F; is_def = bool(h & 0x40)
+        if is_def:
+            arch = data[pos + 1]; en = ">" if arch else "<"
+            gm = struct.unpack(en + "H", data[pos+2:pos+4])[0]
+            n = data[pos + 4]
+            fl = [tuple(data[pos+5+3*i:pos+8+3*i]) for i in range(n)]
+            p2 = pos + 5 + 3 * n
+            dev = b""; ndev = 0
+            if h & 0x20:
+                ndev = data[p2]; dev = data[p2:p2+1+3*ndev]; p2 += 1 + 3 * ndev
+            add = gm in targets and not any(f[0] == 254 for f in fl)
+            defs[lt] = (en, gm, fl, ndev, add)
+            if add:
+                n_ext += 1
+                out += bytes([h, 0, arch]) + data[pos+2:pos+4] + bytes([n + 1])
+                for f in fl: out += bytes(f)
+                out += bytes([254, 2, 0x84]) + dev
+            else:
+                out += data[start:p2]
+            pos = p2
+        else:
+            en, gm, fl, ndev, add = defs[lt]
+            size = sum(f[1] for f in fl)   # Developer-Felder werden von fit_tool nicht geschrieben
+            out += data[start:pos + size]
+            if add: out += struct.pack(en + "H", index)
+            pos += size
+    body = bytes(out)
+    hdr = bytearray(data[:hs])
+    hdr[4:8] = struct.pack("<I", len(body))
+    if hs >= 14: hdr[12:14] = struct.pack("<H", fit_crc(bytes(hdr[:12])))
+    res = bytes(hdr) + body
+    res += struct.pack("<H", fit_crc(res))
+    open(path, "wb").write(res)
+    return n_ext
+
+
+PATCHSTAND = "2026-11-15-r8 (+ Flaschengroesse via volume_used)"
+
+def read_session_fields(path):
+    """Liest Session-Felder (140, 141, 254) zur Kontrolle direkt aus der Datei."""
+    import struct
+    data = open(path, "rb").read()
+    pos, end, defs, res = data[0], len(data) - 2, {}, {}
+    while pos < end:
+        h = data[pos]; pos += 1
+        if h & 0x80:
+            lt = (h >> 5) & 3; is_def = False
+        else:
+            lt = h & 0x0F; is_def = bool(h & 0x40)
+        if is_def:
+            en = ">" if data[pos + 1] else "<"
+            gm = struct.unpack(en + "H", data[pos+2:pos+4])[0]
+            n = data[pos + 4]
+            fl = [tuple(data[pos+5+3*i:pos+8+3*i]) for i in range(n)]
+            pos += 5 + 3 * n
+            if h & 0x20:
+                nd = data[pos]; pos += 1 + 3 * nd
+            defs[lt] = (en, gm, fl)
+        else:
+            en, gm, fl = defs[lt]
+            for fid, sz, _bt in fl:
+                if gm == 18 and fid in (140, 141, 254):
+                    res[fid] = int.from_bytes(data[pos:pos+sz], "little" if en == "<" else "big")
+                pos += sz
+    return res
+
+def fix_dive_depths(path, avg_depth, max_depth):
+    p = {}
+    for gm, a, m in ((18, 140, 141), (19, 122, 123)):   # Session, Lap
+        if avg_depth is not None: p[(gm, a)] = int(round(avg_depth * 1000))
+        if max_depth is not None: p[(gm, m)] = int(round(max_depth * 1000))
+    return patch_fit_fields(path, p)
 
 
 # ---------- FIT-Bau ----------
@@ -204,14 +415,21 @@ def build_fit(d, out_path):
     #   Eintauchen bis Auftauchen. Daraus leitet Garmin Auftauchzeit ab.
     # - bottom_time: eigentliche Tauchzeit (SSRF 'duration'), fuer dive_summary.
     samples = d["samples"]
-    profile_span = samples[-1]["t"] if samples else (d["duration"] or 0)
+    last_t = samples[-1]["t"] if samples else 0
+    # Nie kuerzer als die im Log angegebene Tauchzeit, sonst Dauer 0 / Ende=Start
+    profile_span = max(last_t, d["duration"] or 0)
     bottom_time = d["duration"] or profile_span
+    if profile_span <= 0:
+        raise ValueError("Tauchgang ohne Samples und ohne Dauer - kann keine FIT-Datei erzeugen")
 
     utc_end = utc_start + dt.timedelta(seconds=profile_span)
     local_end = local_start + dt.timedelta(seconds=profile_span)
     start_ms = to_fit_ms_from_utc(utc_start)
     end_ms = to_fit_ms_from_utc(utc_end)
     watertemp_c = int(round(d["watertemp"])) if d["watertemp"] is not None else None
+    avgtemp_c = int(round(d["temp_avg"])) if d["temp_avg"] is not None else watertemp_c
+    maxtemp_c = int(round(d["temp_max"])) if d["temp_max"] is not None else watertemp_c
+    mintemp_c = int(round(d["temp_min"])) if d["temp_min"] is not None else watertemp_c
 
     # FILE ID
     fid = FileIdMessage()
@@ -219,7 +437,8 @@ def build_fit(d, out_path):
     fid.manufacturer = Manufacturer.SUUNTO.value
     fid.product = 1
     fid.time_created = start_ms
-    fid.serial_number = 1
+    fid.serial_number = d.get("dc_serial") or 1
+    if d["dc_model"]: fid.product_name = d["dc_model"]
     b.add(fid)
 
     # DEVICE INFO (Tauchcomputermodell)
@@ -229,6 +448,8 @@ def build_fit(d, out_path):
         di.manufacturer = Manufacturer.SUUNTO.value
         di.product_name = d["dc_model"]
         di.device_index = 0
+        di.product = 1
+        if d.get("dc_serial"): di.serial_number = d["dc_serial"]
         b.add(di)
 
     # DIVE SETTINGS (Wasserart)
@@ -241,12 +462,36 @@ def build_fit(d, out_path):
         dset.bottom_time = float(bottom_time)
         b.add(dset)
 
+    # DIVE GAS (Gasmischung; Luft, falls im Log nichts angegeben ist)
+    if DiveGasMessage is not None:
+        try:
+            dg = DiveGasMessage()
+            dg.message_index = 0
+            dg.oxygen_content = int(round(d["o2"])) if d.get("o2") else 21
+            dg.helium_content = int(round(d["he"])) if d.get("he") else 0
+            try:
+                from fit_tool.profile.profile_type import DiveGasStatus
+                dg.status = DiveGasStatus.ENABLED
+            except Exception:
+                dg.status = 1
+            b.add(dg)
+        except Exception as e:
+            print(f"  HINWEIS: dive_gas nicht schreibbar ({e!r}) - uebersprungen")
+    else:
+        print("  HINWEIS: Diese fit_tool-Version kennt dive_gas nicht - Gas uebersprungen")
+
     # START EVENT
     ev = EventMessage()
     ev.event = Event.TIMER; ev.event_type = EventType.START; ev.timestamp = start_ms
     b.add(ev)
 
-    # RECORDS
+    # RECORDS (+ Flaschendruck als tank_update)
+    tank_sensor = d.get("dc_serial") or 1
+    tank_ok = (TankUpdateMessage is not None and
+               any(x["pressure"] is not None for x in d["samples"]))
+    if d["samples"] and any(x["pressure"] is not None for x in d["samples"]) \
+            and TankUpdateMessage is None:
+        print("  HINWEIS: Diese fit_tool-Version kennt tank_update nicht - Flaschendruck uebersprungen")
     for s in d["samples"]:
         r = RecordMessage()
         r.timestamp = start_ms + s["t"] * 1000
@@ -256,6 +501,16 @@ def build_fit(d, out_path):
         if lat is not None and lon is not None:
             r.position_lat = lat; r.position_long = lon
         b.add(r)
+        if tank_ok and s.get("pressure") is not None:
+            try:
+                tu = TankUpdateMessage()
+                tu.timestamp = r.timestamp
+                tu.sensor = tank_sensor
+                tu.pressure = s["pressure"]          # bar
+                b.add(tu)
+            except Exception as e:
+                tank_ok = False
+                print(f"  HINWEIS: Flaschendruck nicht schreibbar ({e!r}) - uebersprungen")
 
     # STOP EVENT
     ev2 = EventMessage()
@@ -273,13 +528,31 @@ def build_fit(d, out_path):
     add_dive_field(lap, "max_depth", 123, d["maxdepth"])
     b.add(lap)
 
+    # TANK SUMMARY
+    if tank_ok and d["p_start"] is not None and d["p_end"] is not None:
+        try:
+            ts = TankSummaryMessage()
+            ts.timestamp = end_ms
+            ts.sensor = tank_sensor
+            ts.start_pressure = d["p_start"]
+            ts.end_pressure = d["p_end"]
+            # Verbrauchte Gasmenge in Litern (Druckabfall x Flaschengroesse).
+            # Aus volume_used / Druckabfall leiten Reader wie Subsurface die
+            # Flaschengroesse ab; ohne den Wert setzen sie einen Standard (10 L).
+            if d.get("cyl_size") and d["p_start"] > d["p_end"]:
+                ts.volume_used = round(d["cyl_size"] * (d["p_start"] - d["p_end"]), 2)
+            b.add(ts)
+        except Exception as e:
+            print(f"  HINWEIS: tank_summary nicht schreibbar ({e!r}) - uebersprungen")
+
     # SESSION
     sess = SessionMessage()
     sess.timestamp = end_ms; sess.start_time = start_ms
     sess.total_elapsed_time = float(profile_span); sess.total_timer_time = float(profile_span)
     sess.sport = Sport.DIVING; sess.sub_sport = SubSport.SINGLE_GAS_DIVING
-    if watertemp_c is not None:
-        sess.avg_temperature = watertemp_c; sess.max_temperature = watertemp_c
+    if avgtemp_c is not None:
+        sess.avg_temperature = avgtemp_c; sess.max_temperature = maxtemp_c
+        sess.min_temperature = mintemp_c
     if lat is not None and lon is not None:
         sess.start_position_lat = lat; sess.start_position_long = lon
     sess.first_lap_index = 0; sess.num_laps = 1
@@ -294,7 +567,7 @@ def build_fit(d, out_path):
     ds.timestamp = end_ms; ds.reference_mesg = 18; ds.reference_index = 0
     if d["maxdepth"] is not None: ds.max_depth = d["maxdepth"]
     if d["avgdepth"] is not None: ds.avg_depth = d["avgdepth"]
-    ds.bottom_time = float(bottom_time); ds.surface_interval = 0
+    ds.bottom_time = float(bottom_time)
     if d["number"]:
         try: ds.dive_number = int(d["number"])
         except: pass
@@ -309,6 +582,15 @@ def build_fit(d, out_path):
     b.add(act)
 
     b.build().to_file(out_path)
+    add_message_index(out_path)
+    n_fix = fix_dive_depths(out_path, d["avgdepth"], d["maxdepth"])
+    chk = read_session_fields(out_path)
+    ok = (chk.get(254) == 0 and
+          (d["avgdepth"] is None or chk.get(140) == int(round(d["avgdepth"] * 1000))) and
+          (d["maxdepth"] is None or chk.get(141) == int(round(d["maxdepth"] * 1000))))
+    print(f"  FIT-Check: Session Ø-Tiefe={chk.get(140, 0)/1000:.1f} m, "
+          f"max={chk.get(141, 0)/1000:.1f} m, message_index={chk.get(254)} -> "
+          f"{'OK' if ok else 'FEHLER (Patch nicht angewendet!)'}  [{n_fix} Tiefenfelder gepatcht]")
     return {"tz": tzname, "local": local_start, "depth": d["maxdepth"],
             "dur": bottom_time, "n": len(d["samples"]), "site": site.get("name"),
             "country": site.get("country"), "suit": d["suit"],
@@ -318,6 +600,7 @@ def build_fit(d, out_path):
 def main():
     if len(sys.argv) < 2:
         print(__doc__); sys.exit(1)
+    print("ssrf2fit Patchstand:", PATCHSTAND)
     src = sys.argv[1]; rest = sys.argv[2:]
     do_all = "--all" in rest
     outdir = "."

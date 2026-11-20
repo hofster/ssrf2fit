@@ -43,8 +43,8 @@ def test_extract_dive_multi_dc_heart_rate():
     hrs = [smp["hr"] for smp in d["samples"]]
     # 0:05 -> matched to 0:06 (65), 0:10 -> exact (72), 0:15 -> matched to 0:16 (80), 0:20 -> matched to 0:16 (80)
     assert hrs == [65, 72, 80, 80]
-    assert d["hr_avg"] == 74
-    assert d["hr_max"] == 80
+    assert d["avg_hr"] == 74
+    assert d["max_hr"] == 80
 
 
 @pytest.mark.skipif(not HAS_SDK, reason="garmin_fit_sdk nicht installiert")
